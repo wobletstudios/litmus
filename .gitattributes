@@ -1,2 +1,3 @@
 # Text files are LF everywhere, regardless of platform
 * text=auto eol=lf
+
