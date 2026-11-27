@@ -5,6 +5,7 @@ place = 109535589334533
 [standalone]
 run = ["lune", "run"]
 lib = "lib"
+timeout = 300
 
 specs = ["tests"]
 adapter = "tests/Adapter.luau"

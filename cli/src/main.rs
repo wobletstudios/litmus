@@ -1,5 +1,6 @@
 mod cloud;
 mod config;
+mod interrupt;
 mod luau;
 mod manifest;
 mod piece;
@@ -17,6 +18,7 @@ mod style;
 mod testing;
 
 use config::Config;
+use interrupt::Interrupt;
 use manifest::Manifest;
 use render::Sources;
 use results::Run;
@@ -56,8 +58,11 @@ litmus.toml:
   [cloud]             The experience and its place, as `universe` and `place`; and as `build`, a .rbxl to use as
                       the new version, when Rojo alone doesn't build the whole place
   [standalone]        The command that runs a Luau file, as `run`; the folder of litmus's lib, as `lib`; where to
-                      look for .spec files, as `specs`; and for a project with an adapter of its own, that file
-                      as `adapter` and the flags it takes as `flags`
+                      look for .spec files, as `specs`; and the required whole-runtime limit in seconds, as
+                      `timeout` (300 keeps the old 5-minute limit; 0 disables execution expiry, not cleanup)
+                      Optional `specs_at_once` limits concurrent specs, not runtime duration. For a project with
+                      an adapter of its own, that file is `adapter` and the flags it takes are `flags`.
+                      `timeout` is separate from `specs_at_once` and adapter flags, not a command-line flag.
 
 A cloud run also needs:
   LITMUS_API_KEY      The Open Cloud API key to run under, read from the environment, or else from the project's .env
@@ -118,11 +123,7 @@ impl TestCommand {
             }
         }
 
-        Ok(TestCommand {
-            backend: backend.and_then(Backend::named).unwrap_or(Backend::Plugin),
-            flags,
-            paths,
-        })
+        Ok(TestCommand { backend: backend.and_then(Backend::named).unwrap_or(Backend::Plugin), flags, paths })
     }
 }
 
@@ -162,9 +163,9 @@ impl Command {
         }
     }
 
-    fn run(self) -> Result<bool, String> {
+    fn run(self, interrupt: &Interrupt) -> Result<bool, String> {
         match self {
-            Command::Test(command) => run_tests(&command),
+            Command::Test(command) => run_tests(&command, interrupt),
             Command::PluginInstall => plugin::install().and(Ok(true)),
             Command::PluginUninstall => plugin::uninstall().and(Ok(true)),
             Command::Help => {
@@ -190,7 +191,27 @@ fn main() -> ExitCode {
         }
     };
 
-    match command.run() {
+    dispatch(command)
+}
+
+fn dispatch(command: Command) -> ExitCode {
+    let interrupt = Interrupt::default();
+    if matches!(&command, Command::Test(command) if command.backend == Backend::Standalone)
+        && let Err(error) = interrupt.install()
+    {
+        eprintln!("litmus: couldn't install the interrupt handler: {error}");
+        return ExitCode::from(2);
+    }
+
+    let outcome = command.run(&interrupt);
+    if let Some(signal) = interrupt.signal() {
+        if let Err(message) = &outcome {
+            eprintln!("litmus: {message}");
+        }
+        interrupt::terminate(signal);
+    }
+
+    match outcome {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(message) => {
@@ -200,15 +221,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_tests(command: &TestCommand) -> Result<bool, String> {
+fn run_tests(command: &TestCommand, interrupt: &Interrupt) -> Result<bool, String> {
     let project_dir = Path::new(".");
 
     if command.backend != Backend::Standalone
         && let Some(flag) = command.flags.first()
     {
-        return Err(format!(
-            "--{flag} isn't an option of litmus; a flag of the project's own goes with --standalone"
-        ));
+        return Err(format!("--{flag} isn't an option of litmus; a flag of the project's own goes with --standalone"));
     }
 
     let selection = Selection::of(&command.paths)?;
@@ -216,7 +235,7 @@ fn run_tests(command: &TestCommand) -> Result<bool, String> {
     let ran = match command.backend {
         Backend::Plugin => run_with_plugin(project_dir, &selection)?,
         Backend::Cloud => run_in_cloud(project_dir, &selection)?,
-        Backend::Standalone => run_standalone(project_dir, &command.flags, &selection)?,
+        Backend::Standalone => run_standalone(project_dir, &command.flags, &selection, interrupt)?,
     };
 
     let run = Run::deserialize(&ran.results)
@@ -233,23 +252,17 @@ fn run_tests(command: &TestCommand) -> Result<bool, String> {
     Ok(run.passed())
 }
 
-fn run_standalone(project_dir: &Path, flags: &[String], selection: &Selection) -> Result<Ran, String> {
+fn run_standalone(project_dir: &Path, flags: &[String], selection: &Selection, interrupt: &Interrupt) -> Result<Ran, String> {
     let standalone = Config::read(project_dir)?.standalone()?;
 
-    Ok(Ran {
-        results: standalone::run(project_dir, &standalone, flags, selection)?,
-        sources: Sources::Disk,
-    })
+    Ok(Ran { results: standalone::run(project_dir, &standalone, flags, selection, interrupt)?, sources: Sources::Disk })
 }
 
 fn run_with_plugin(project_dir: &Path, selection: &Selection) -> Result<Ran, String> {
     let config = Config::read(project_dir)?;
     let manifest = manifest_of(project_dir, &config, selection)?;
 
-    Ok(Ran {
-        results: plugin::run(&manifest)?,
-        sources: Sources::of(&manifest),
-    })
+    Ok(Ran { results: plugin::run(&manifest)?, sources: Sources::of(&manifest) })
 }
 
 fn run_in_cloud(project_dir: &Path, selection: &Selection) -> Result<Ran, String> {
@@ -259,10 +272,7 @@ fn run_in_cloud(project_dir: &Path, selection: &Selection) -> Result<Ran, String
     let rojo_project = config.rojo_project();
     let target = config.cloud()?;
 
-    Ok(Ran {
-        results: cloud::run(project_dir, &manifest, &target, rojo_project.as_deref())?,
-        sources: Sources::of(&manifest),
-    })
+    Ok(Ran { results: cloud::run(project_dir, &manifest, &target, rojo_project.as_deref())?, sources: Sources::of(&manifest) })
 }
 
 fn manifest_of(project_dir: &Path, config: &Config, selection: &Selection) -> Result<Manifest, String> {
@@ -356,13 +366,9 @@ mod tests {
 
     #[test]
     fn a_flag_of_the_project_only_goes_with_a_standalone_run() {
-        let command = TestCommand {
-            backend: Backend::Cloud,
-            flags: vec!["coverage".to_owned()],
-            paths: vec![],
-        };
+        let command = TestCommand { backend: Backend::Cloud, flags: vec!["coverage".to_owned()], paths: vec![] };
 
-        let problem = run_tests(&command).unwrap_err();
+        let problem = run_tests(&command, &Interrupt::default()).unwrap_err();
 
         assert!(problem.contains("--coverage") && problem.contains("--standalone"), "{problem}");
     }

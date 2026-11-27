@@ -123,6 +123,7 @@ build = "build.rbxl"
 run = ["lune", "run"]
 lib = "litmus/lib"
 specs = ["tests"]
+timeout = 300
 adapter = "tests/Adapter.luau"
 flags = ["coverage"]
 specs_at_once = 1
@@ -130,7 +131,23 @@ specs_at_once = 1
 
 - **`[rojo]`**: `project` is the Rojo project a plugin or cloud run reads the place from, when it isn't the default one.
 - **`[cloud]`**: `universe` and `place` name the experience and its place. Each run saves the project as a new, unpublished version of that place. `build` is a `.rbxl` to use as that version, for when Rojo alone doesn't build the whole place.
-- **`[standalone]`**: `run` is the command that runs a Luau file, `lib` is the folder of litmus's lib, and `specs` is where to look for `.spec` files. `adapter` and `flags` are for a project with an adapter of its own. `specs_at_once` is how many specs may run at the same time: the next spec waits to load until one finishes. Leave it out to load every spec straight away, as before; a low limit keeps specs that hold a lot in memory from all holding it at once. With a limit, a run takes about as long as its specs one after another rather than its slowest spec, and a standalone run still stops after 5 minutes. The key needs a lib from litmus 0.4.2 or later; an older lib ignores it and loads every spec at once.
+- **`[standalone]`** → `run` is the command that runs a Luau file, `lib` is the folder
+  of litmus's lib, and `specs` is where to look for `.spec` files. `timeout` is required
+  and gives the whole-runtime limit in unsigned integer seconds. Set it to `300` to keep
+  the old 5-minute limit, or `0` to disable execution expiry. A positive value is one fixed
+  deadline for the whole runtime, not a per-spec or idle timeout, and progress never resets
+  it. Values that the platform's clock cannot represent are rejected before launch.
+  Disabling expiry does not disable interruption or process-tree cleanup after completion,
+  interruption, or output failure. There is no default, environment override, or timeout
+  command-line flag. `adapter` and `flags` are for a project with an adapter of its own;
+  `timeout` is separate from those flags and from `specs_at_once`.
+
+  `specs_at_once` is how many specs may run at the same time. The next spec waits to load
+  until one finishes. Leave it out to load every spec straight away, as before; a low limit
+  keeps specs that hold a lot in memory from all holding it at once. With a limit, a run
+  takes about as long as its specs one after another rather than its slowest spec, so choose
+  a `timeout` that allows for that total duration. The concurrency key needs a lib from
+  litmus 0.4.2 or later; an older lib ignores it and loads every spec at once.
 
 A cloud run also needs an Open Cloud API key in `LITMUS_API_KEY`, read from the environment or else from the project's `.env`. Keep `.env` out of version control.
 
